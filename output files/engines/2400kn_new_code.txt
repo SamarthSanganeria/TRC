@@ -53,3 +53,25 @@ fuel rich preburner O/F (R_pbf) = 0.404
 oxidiser rich preburner O/F (R_pbo) = 30.863
 
 --- MAX RESIDUAL = 1.439e-06% ---
+
+COMPONENT DIMENSIONS
+
+=== Gas Generator Dimensions ===
+Diameter of Oxidiser rich chamber    : 0.378932
+SMD LOX (microns)                    : 255.073
+Diameter of Fuel rich chamber        : 0.378792
+SMD LCH4 (microns)                   : 478.849
+
+=== Main Combustion Chamber Dimensions ===
+Chamber Length (m)            : 0.0987338
+
+=== Fuel-Rich Injector ===
+Mass flow per hole: 0.2452 kg/s
+Number of fuel injectors: 849.8
+
+=== Oxidizer-Rich Injector ===
+Required mass flow per injector: 0.1603 kg/s
+Calculated oxidizer injector diameter: 3.331 mm
+Actual mass flow per hole (verified): 0.1603 kg/s
+
+Check — Local O/F from 1 FR + 4 OR injectors = 3.595

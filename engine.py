@@ -882,6 +882,9 @@ class engine:
         self.engine_name=engine_name
         self.input_file="input files/engines/"+engine_name+".json"
         self.output_file="output files/engines/"+engine_name+".txt"
+        sys.stdout = open(self.output_file, 'w')
+        sys.stdout.close()
+        sys.stdout = sys.__stdout__
         with open(self.input_file) as file:
             self.data = json.load(file)
         self.read_fuel_data()
@@ -933,7 +936,6 @@ class engine:
 
         self.symbols = ["D_E", "Isp", "Thrust", "p_c", "m_f", "m_o", "m_tf", "m_to", "m_ff", "m_fo", "m_of", "m_oo", "p_f2", "p_o2", "p_f3", "p_o3", "p_f4", "p_o4", "pi_tf", "pi_to", "delta_p_f", "delta_p_o", "P_f", "P_o", "g_f", "g_o", "gamma_pbf", "gamma_pbo", "M_pbf", "M_pbo", "T_pbf", "T_pbo", "R_pbf", "R_pbo"]
         
-
     def create_interpolation_functions(self):#,query_pressure, query_of):
         # Load the data
         data = np.loadtxt("data files/LOXMETHANE.txt", skiprows=1)  # Skip header
@@ -984,7 +986,6 @@ class engine:
         self.data["m_z"]=self.data["Thrust"]/self.isp(self.data["oxidiser by fuel"],self.data["p_c"])
         self.data["A_t"]=self.data["m_z"]*self.cstar(self.data["oxidiser by fuel"],self.data["p_c"])/self.data["p_c"]
 
-    
     def read_fuel_data(self):
         self.fuel_data=np.genfromtxt("data files/LOXMETHANE cleaned.txt")[1:].T
         self.fuel_data_heads=["O/F","temp","isp","mw","cstar","gamma"]
@@ -1040,7 +1041,6 @@ class engine:
         A_e=A_Astar_sup*self.A_t
         d_e=(A_e/pi)**0.5*2
         return d_e
-
 
     '''
     def c_star(self):
@@ -1110,7 +1110,6 @@ class engine:
         self.R_pb=ans.x
         self.R_pbf=ans.x[0]
         self.R_pbo=ans.x[1]
-
 
     def inner_convergence(self): #obsolete
         while True:
@@ -1287,7 +1286,7 @@ class engine:
             return eqs[31]/eqs2[31],eqs[32]/eqs2[32]
 
     def get_output(self,print_residual=True):
-        sys.stdout = open(self.output_file, 'w')
+        sys.stdout = open(self.output_file, 'a')
         print(f"***********************************************  {self.engine_name} ENGINE  ***********************************************")
         print()
         print(f"--- INPUT PARAMETERS ---\n")
@@ -1337,11 +1336,368 @@ class engine:
         sys.stdout.close()
         sys.stdout = sys.__stdout__
 
+    def run_injector_calculations(self):
+
+        def compute_Zfu_inj_tc(gamma, Pc, Pup, Pe):
+            term1 = (2 * gamma) / (gamma - 1)
+            exp1 = (Pc / Pup) ** (2 / gamma)
+            exp2 = (Pc / Pup) ** ((gamma + 1) / gamma)
+            return term1 * (exp1 - exp2)
+
+        def injector_hole_area(d_mm):
+            d_m = d_mm / 1000
+            return math.pi * d_m ** 2 / 4
+
+        def mass_flow_per_hole(CD, A, Pup, Z, R, T, Mw):
+            return CD * A * Pup * Z / ((R * T / Mw) ** 0.5)
+
+        def number_of_injector_holes(mdot_total, CD, d_mm, Pup, Z, R, T, Mw):
+            A = injector_hole_area(d_mm)
+            m_dot_per_hole = mass_flow_per_hole(CD, A, Pup, Z, R, T, Mw)
+            N = mdot_total / m_dot_per_hole
+            return N, m_dot_per_hole
+
+        # --- FUEL-RICH SIDE ---
+        mdot_total_fu = 208.333        # total fuel-rich flow (kg/s)
+        CD_fu = 0.8
+        d_fu_mm = 5
+        Pup_fu = 36e6
+        Pc = 30e6
+        Pe = 1e5
+        gamma_fu = 1.1458
+        R = 8314
+        Mw_fu = 17.4
+        T_fu = 765.5
+
+        Z_fu = compute_Zfu_inj_tc(gamma_fu, Pc, Pup_fu, Pe)
+        N_fu, mdot_fu_per_hole = number_of_injector_holes(mdot_total_fu, CD_fu, d_fu_mm, Pup_fu, Z_fu, R, T_fu, Mw_fu)
+
+        # --- OXIDIZER-RICH SIDE ---
+        CD_ox = 0.8
+        Pup_ox = 36e6
+        gamma_ox = 1.3176
+        Mw_ox = 31.47
+        T_ox = 679
+        Z_ox = compute_Zfu_inj_tc(gamma_ox, Pc, Pup_ox, Pe)
+
+        # Derived from mixture balance:
+        mdot_ratio_ox_to_fu = 0.654   # one oxidizer-rich per one fuel-rich
+
+        # Each set: 1 fuel-rich injector, 4 oxidizer-rich injectors
+        mdot_ox_target_per_inj = mdot_fu_per_hole * mdot_ratio_ox_to_fu
+
+        def find_diameter_for_mdot(target_mdot, CD, Pup, Z, R, T, Mw):
+            d = 0.1  # initial guess (mm)
+            for _ in range(10000):
+                A = injector_hole_area(d)
+                mdot = mass_flow_per_hole(CD, A, Pup, Z, R, T, Mw)
+                if abs(mdot - target_mdot) < 1e-6:
+                    break
+                d *= (target_mdot / mdot) ** 0.5
+            return d, mdot
+
+        d_ox_mm, mdot_ox_per_hole = find_diameter_for_mdot(mdot_ox_target_per_inj, CD_ox, Pup_ox, Z_ox, R, T_ox, Mw_ox)
+
+        # Verification of local O/F
+        O_F_fr = 0.38
+        O_F_or = 41
+        F_fr = 1 / (1 + O_F_fr) * mdot_fu_per_hole
+        O_fr = O_F_fr * F_fr
+        F_or = 1 / (1 + O_F_or) * mdot_ox_per_hole
+        O_or = O_F_or * F_or
+        OF_local = (O_fr + 4 * O_or) / (F_fr + 4 * F_or)
+
+        sys.stdout = open(self.output_file, 'a')
+
+        print("=== Fuel-Rich Injector ===")
+        print(f"Mass flow per hole: {mdot_fu_per_hole:.4f} kg/s")
+        print(f"Number of fuel injectors: {N_fu:.1f}")
+
+        print("\n=== Oxidizer-Rich Injector ===")
+        print(f"Required mass flow per injector: {mdot_ox_target_per_inj:.4f} kg/s")
+        print(f"Calculated oxidizer injector diameter: {d_ox_mm:.3f} mm")
+        print(f"Actual mass flow per hole (verified): {mdot_ox_per_hole:.4f} kg/s")
+
+        print(f"\nCheck — Local O/F from 1 FR + 4 OR injectors = {OF_local:.3f}")
+
+        sys.stdout.close()
+        sys.stdout = sys.__stdout__
+
+    def calculate_chamber_dimensions(self, C_smd=2.5):
+
+        m_z          = 53.12        # total mass flow (kg/s)
+        deltaP_inj   = 1.2e6        # injector ΔP = 12 bar
+
+        C_smd        = C_smd          # empirical constant
+        gamma_gas    = 1.1301       # from CEA
+        Cstar        = 1837.0       # m/s
+        p_c_val      = 60e5         # Pa (60 bar)
+
+        rho_o        = self.rho_o       # oxidiser density (kg/m^3)
+        sigma_LOX    = 0.013        # N/m
+        rho_LOX      = 1140.0       # kg/m³
+        k_LOX        = 1327.8       # To be found s/m^2 
+        D_pipe_LOX   = 0.4          # m
+
+        rho_f        = self.rho_f        # fuel density (kg/m^3)
+        sigma_LCH4   = 0.017        # N/m
+        rho_LCH4     = 423.0        # kg/m³
+        k_LCH4       = 376.34       # To be found s/m^2
+        D_pipe_LCH4  = 0.4          # m
+
+        L_star_CC    = 76.2886      # To be found
+        D_chamber    = 4            # m
+
+        # SMD calculations
+
+        SMD_LOX_m   = C_smd * math.sqrt(sigma_LOX / rho_LOX) * (deltaP_inj ** (-0.25))
+        SMD_LCH4_m  = C_smd * math.sqrt(sigma_LCH4 / rho_LCH4) * (deltaP_inj ** (-0.25))
+        SMD_LOX_um  = SMD_LOX_m * 1e6
+        SMD_LCH4_um = SMD_LCH4_m * 1e6
+        t_res_LOX   = (k_LOX * SMD_LOX_m * SMD_LOX_m)/0.7
+        t_res_LCH4  = (k_LCH4 * SMD_LCH4_m * SMD_LCH4_m)/0.7
+        L_star_LOX  = Cstar * t_res_LOX
+        L_star_LCH4 = Cstar * t_res_LCH4
+        A_t_LOX     = (math.pi * D_pipe_LOX * D_pipe_LOX)/4
+        A_t_LCH4     = (math.pi * D_pipe_LCH4 * D_pipe_LCH4)/4
+        D_chamber_LOX   = 2 * (((t_res_LOX * A_t_LOX * 3 * Cstar) / (4 * math.pi)) ** (1/3))
+        D_chamber_LCH4   = 2 * (((t_res_LCH4 * A_t_LCH4 * 3 * Cstar) / (4 * math.pi)) ** (1/3))
+
+        # Main Combustion Chamber 
+
+        A_t = Cstar * m_z / p_c_val
+        L_CC = (4 * A_t * L_star_CC) / (math.pi * D_chamber * D_chamber)
+
+        # PRINT 
+
+        sys.stdout = open(self.output_file, 'a')
+        print(f"\nCOMPONENT DIMENSIONS")
+        print("\n=== Gas Generator Dimensions ===")
+        print(f"Diameter of Oxidiser rich chamber    : {D_chamber_LOX:.6g}")
+        print(f"SMD LOX (microns)                    : {SMD_LOX_um:.6g}")
+        print(f"Diameter of Fuel rich chamber        : {D_chamber_LCH4:.6g}")
+        print(f"SMD LCH4 (microns)                   : {SMD_LCH4_um:.6g}")
+
+        print("\n=== Main Combustion Chamber Dimensions ===")
+        print(f"Chamber Length (m)            : {L_CC:.6g}")
+
+        print()
+
+        sys.stdout.close()
+        sys.stdout = sys.__stdout__
+
+    def run_multall(self):
+        print("Running multall")
+        #cygwin_mintty = r"C:\cygwin64\bin\mintty.exe"
+        #project_dir = "/cygdrive/c/Users/lenovo/PycharmProjects/Multall_Codes"
+
+        cwd = os.getcwd()
+
+        cygwin_mintty = os.path.join(cwd, "cygwin", "bin", "mintty.exe")
+        #cygwin_bash = os.path.join(cwd, "cygwin", "bin", "bash.exe")
+        project_dir = os.path.join(cwd, "multall")
+
+        # Convert Windows paths to Cygwin style for commands inside mintty
+        project_dir_cyg = "/cygdrive/" + project_dir[0].lower() + project_dir[2:].replace("\\", "/")
+        project_dir=project_dir_cyg
+
+        commands = f'''cd {project_dir} && \
+    echo "Compiling MEANGEN..." && \
+    gfortran -o5 meangen-17.4.f -o meangen-17.4.x && \
+    echo "Running MEANGEN with input file..." && \
+    echo F | ./meangen-17.4.x < meangen.in && \
+    echo "Compiling STAGEN..." && \
+    gfortran -o5 stagen-17.3.f -o stagen-17.3.x && \
+    echo "Running STAGEN..." && \
+    ./stagen-17.3.x < stagen.dat && \
+    echo "Compiling MULTALL..." && \
+    gfortran -o5 multall-open-17.5.f -o multall-open-17.5.x && \
+    echo "Running MULTALL..." && \
+    ./multall-open-17.5.x < stage_new.dat ; '''#exec bash'''
+
+        cmd = [
+            cygwin_mintty,
+            "-i", "/Cygwin-Terminal.ico",
+            "-e", "/bin/bash", "-l", "-c", commands
+        ]
+
+        subprocess.Popen(cmd)
+        
+    def run_multall_2(self):
+
+        cwd = os.getcwd()
+        #cygwin_bash = os.path.join(cwd, "cygwin", "bin", "bash.exe")
+        cygwin_bash = r"D:\cygwin\bin\bash.exe"
+        project_dir = os.path.join(cwd, "multall")
+
+        # Convert Windows path to Cygwin style
+        project_dir_cyg = "/cygdrive/" + project_dir[0].lower() + project_dir[2:].replace("\\", "/")
+
+        commands = f"""
+        cd '{project_dir_cyg}' && \
+        echo "Compiling MEANGEN..." && \
+        gfortran -o5 meangen-17.4.f -o meangen-17.4.x && \
+        echo "Running MEANGEN..." && \
+        echo F | ./meangen-17.4.x < meangen.in && \
+        echo "Compiling STAGEN..." && \
+        gfortran -o5 stagen-17.3.f -o stagen-17.3.x && \
+        echo "Running STAGEN..." && \
+        ./stagen-17.3.x < stagen.dat && \
+        echo "Compiling MULTALL..." && \
+        gfortran -o5 multall-open-17.5.f -o multall-open-17.5.x && \
+        echo "Running MULTALL..." && \
+        ./multall-open-17.5.x < stage_new.dat && \
+        echo "Multall tasks finished!"
+        """
+
+        # Run bash directly
+        process = subprocess.Popen([cygwin_bash, "-l", "-c", commands])
+        return_code = process.wait()
+
+        print("Python: All Fortran commands completed. Exit code:", return_code)
+
+        if return_code == 0:
+            with open("multall/meangen.in", "r") as f:
+                meangen_input = f.read()
+            sys.stdout = open(self.output_file, 'a')
+            print("\n=== MEANGEN Input File Contents ===")
+            print(meangen_input)
+            sys.stdout.close()
+            sys.stdout = sys.__stdout__
+
+    def write_meangen_file(self,params, output_file="multall/meangen.in"):
+  
+        def get_param(params, key, default=None):
+            return params.get(key, default)
+        
+        with open(output_file, "w") as f:
+            turbo_type = get_param(params, "compressor or turbine", "C")
+            flow_type = get_param(params, "axial or radial", "AXI")
+            gas_constant = get_param(params, "gas constant", "287.500")
+            gamma = get_param(params, "gamma", "1.4")
+            stagnation_pressure = get_param(params, "stagnation pressure in bar", "1.000")
+            inlet_temp = get_param(params, "inlet temperature in deg K", "300.000")
+            num_stages = get_param(params, "no of stages", "1")
+            design_radius_choice = get_param(params, "design radius choice", "M")
+            rpm = get_param(params, "input rpm", "5000.000")
+            mass_flow = get_param(params, "mass flow rate", "50.000")
+            vel_method = get_param(params, "velocity triangles method", "A")
+            reaction = get_param(params, "reaction", "0.600")
+            flow_coeff = get_param(params, "flow coefficient", "0.600")
+            loading_coeff = get_param(params, "stage loading coeff", "0.350")
+            radtype = get_param(params, "design radius type", "A")
+            design_radius = get_param(params, "design radius", "0.500")
+            blade_chord_1 = get_param(params, "first blade row axial chord", "0.050")
+            blade_chord_2 = get_param(params, "second blade row axial chord", "0.040")
+            row_gap = get_param(params, "row gap", "0.250")
+            stage_gap = get_param(params, "interstage gap", "0.500")
+            blockage_le = get_param(params, "blockage factor leading edge", "0.00000")
+            blockage_te = get_param(params, "blockage factor trailing edge", "0.00000")
+            efficiency = get_param(params, "stage efficiency", "0.900")
+            deviation_angle_1 = get_param(params, "first row deviation angle", "5.000")
+            deviation_angle_2 = get_param(params, "second row deviation angle", "5.000")
+            incidence_1 = get_param(params, "first row incidence angle", "-2.000")
+            incidence_2 = get_param(params, "second row incidence angle", "-2.000")
+            blade_twist = get_param(params, "free vortex or no twist", "1.00000")
+            blade_rotate = get_param(params, "rotate", "n")
+            qo_le1 = get_param(params, "QO angle at LE row 1", "88.000")
+            qo_te1 = get_param(params, "QO angle at TE row 1", "92.000")
+            qo_le2 = get_param(params, "QO angle at LE row 2", "92.000")
+            qo_te2 = get_param(params, "QO angle at TE row 2", "88.000")
+            change_angles = get_param(params, "change angles", "n")
+            all_rows_output = get_param(params, "output for all blade rows", "Y")
+
+            # Write 
+            f.write(f'{turbo_type}                        TURBO_TYP,"C" FOR A COMPRESSOR,"T" FOR A TURBINE\n')
+            f.write(f'{flow_type}                      FLO_TYP FOR AXIAL OR MIXED FLOW MACHINE \n')
+            f.write(f'   {gas_constant}     {gamma}     GAS PROPERTOES, RGAS, GAMMA \n')
+            f.write(f'     {stagnation_pressure}   {inlet_temp}     POIN,  TOIN \n')
+            f.write(f'    {num_stages}                    NUMBER OF STAGES IN THE MACHINE \n')
+            f.write(f'{design_radius_choice}                        CHOICE OF DESIGN POINT RADIUS, HUB, MID or TIP\n')
+            f.write(f'    {rpm}             ROTATION SPEED, RPM \n')
+            f.write(f'      {mass_flow}             MASS FLOW RATE, FLOWIN. \n')
+            f.write(f'{vel_method}                        INTYPE, TO CHOOSE THE METHOD OF DEFINING THE VELOCITY TRIANGLES\n')
+            f.write(f'  {reaction}  {flow_coeff}  {loading_coeff}    REACTION, FLOW COEFF., LOADING COEFF.\n')
+            f.write(f'{radtype}                        RADTYPE, TO CHOOSE THE DESIGN POINT RADIUS\n')
+            f.write(f'       {design_radius}             THE DESIGN POINT RADIUS \n')
+            f.write(f'       {blade_chord_1}       {blade_chord_2} BLADE AXIAL CHORDS IN METRES.\n')
+            f.write(f'       {row_gap}       {stage_gap} ROW GAP  AND STAGE GAP \n')
+            f.write(f'   {blockage_le}   {blockage_te}     BLOCKAGE FACTORS, FBLOCK_LE,  FBLOCK_TE \n')
+            f.write(f'       {efficiency}             GUESS OF THE STAGE ISENTROPIC EFFICIENCY\n')
+            f.write(f'   {deviation_angle_1}   {deviation_angle_2}         ESTIMATE OF THE FIRST AND SECOND ROW DEVIATION ANGLES\n')
+            f.write(f'  {incidence_1}  {incidence_2}         FIRST AND SECOND ROW INCIDENCE ANGLES\n')
+            f.write(f'   {blade_twist}               BLADE TWIST OPTION, FRAC_TWIST\n')
+            f.write(f'{blade_rotate}                        BLADE ROTATION OPTION , Y or N\n')
+            f.write(f'  {qo_le1}  {qo_te1}         QO ANGLES AT LE  AND TE OF ROW 1 \n')
+            f.write(f'  {qo_le2}  {qo_te2}         QO ANGLES AT LE  AND TE OF ROW 2 \n')
+            f.write(f'{change_angles}                        DO YOU WANT TO CHANGE THE ANGLES FOR THIS STAGE ? "Y" or "N"\n')
+            f.write(f'{all_rows_output}                        IS OUTPUT REQUESTED FOR ALL BLADE ROWS ? \n')
+            # Template for following lines, fill with defaults or input mapping as needed:
+            f.write('Y    ROTOR No.   1 SET ANSTK = "Y" TO USE THE SAME  BLADE SECTIONS AS THE LAST STAGE\n')
+            f.write('N    STATOR No.  1 SET ANSTK = "Y" TO USE THE SAME  BLADE SECTIONS AS THE LAST STAGE\n')
+            f.write('  0.1000  0.4500         MAX THICKNESS AND ITS LOCATION FOR STATOR  1 SECTION No.  1\n')
+            f.write('  0.1000  0.4500         MAX THICKNESS AND ITS LOCATION FOR STATOR  1 SECTION No.  2\n')
+            f.write('  0.1000  0.4500         MAX THICKNESS AND ITS LOCATION FOR STATOR  1 SECTION No.  3\n')
+            print(f"meangen.in successfully created at:\n{output_file}")
+
+    def main(self):
+
+        print("Calculating equilibrium\n")
+        #eng=engine("2400kn_new_code")
+        self.inner_convergence2()
+        self.calculate_all_parameters(print_residuals=False,print_max_residual=True)
+        self.get_output()
+        print("Calculating injector dimensions\n")
+        self.calculate_chamber_dimensions()
+        print("Calculating turbine dimensions\n")
+        self.run_injector_calculations()
+        print("Calculating combustion chamber size\n")
+        
+        meangen_params = {
+                "type": "T",
+                "configuration": "AXI",
+                "gas_constant": 287.500,
+                "gamma": 1.1300,
+                "stagnation_pressure_bar": 800,
+                "inlet_temperature_K": 1000.000,
+                "num_stages": 2,
+                "design_radius_choice": "M",
+                "rpm": 5000.000,
+                "mass_flow_rate": 50.000,
+                "velocity_triangles_method": "A",
+                "reaction": 0.600,
+                "flow_coefficient": 0.600,
+                "stage_loading_coeff": 0.350,
+                "design_radius_type": "A",
+                "design_radius": 0.500,
+                "first_axial_chord": 0.050,
+                "second_axial_chord": 0.040,
+                "row_gap": 0.250,
+                "interstage_gap": 0.500,
+                "blockage_factor_LE": 0.00000,
+                "blockage_factor_TE": 0.00000,
+                "stage_efficiency": 0.900,
+                "first_row_deviation_angle": 5.000,
+                "second_row_deviation_angle": 5.000,
+                "first_row_incidence_angle": -2.000,
+                "second_row_incidence_angle": -2.000,
+                "free_vortex_or_no_twist": 1.00000,
+                "rotate": "n",
+                "qo_angle_LE_row1": 88.000,
+                "qo_angle_TE_row1": 92.000,
+                "qo_angle_LE_row2": 92.000,
+                "qo_angle_TE_row2": 88.000,
+                "change_angles": "n",
+                "output_all_rows": "Y",
+                "rotor1_ANSTK": "Y",
+                "stator1_ANSTK": "N",
+                "stator1_section1": {"max_thickness": 0.1000, "location": 0.4500},
+                "stator1_section2": {"max_thickness": 0.1000, "location": 0.4500},
+                "stator1_section3": {"max_thickness": 0.1000, "location": 0.4500},
+            }
+        
+        self.write_meangen_file(meangen_params)
+        self.run_multall_2()
 
 eng=engine("2400kn_new_code")
-eng.inner_convergence2()
-eng.calculate_all_parameters(print_residuals=False,print_max_residual=True)
-eng.get_output()
-#print(eng.c_star())
-#print(eng.cstar(eng.R))3
-print("lol")
+eng.main()

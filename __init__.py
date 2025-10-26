@@ -27,6 +27,8 @@ import copy
 from PIL import Image, ImageDraw, ImageFont
 from scipy.interpolate import LinearNDInterpolator
 from skopt import gp_minimize
+import subprocess
+import os
 
 #Defining some required constants
 g=9.8 #m/s^2
@@ -46,3 +48,5 @@ import stage_optimizer
 import trajectory
 import tank
 import utils
+#import engine
+#import TRC_inj
